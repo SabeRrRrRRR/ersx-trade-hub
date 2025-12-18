@@ -7,8 +7,14 @@ import { Input } from '@/components/ui/input';
 import { useToast } from '@/hooks/use-toast';
 import { supabase } from '@/integrations/supabase/client';
 import { formatDate, formatCurrency } from '@/lib/supabase-helpers';
-import { Users, Ban, Check, X, Search, DollarSign } from 'lucide-react';
+import { Users, Ban, Check, X, Search, DollarSign, Send } from 'lucide-react';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from '@/components/ui/dialog';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+import { Label } from '@/components/ui/label';
+import { Database } from '@/integrations/supabase/types';
+
+type UserStatus = Database['public']['Enums']['user_status'];
 
 const Admin = () => {
   const { user, role, loading } = useAuth();
@@ -17,6 +23,10 @@ const Admin = () => {
   const [users, setUsers] = useState<any[]>([]);
   const [withdrawals, setWithdrawals] = useState<any[]>([]);
   const [searchTerm, setSearchTerm] = useState('');
+  const [transferOpen, setTransferOpen] = useState(false);
+  const [transferFrom, setTransferFrom] = useState('');
+  const [transferTo, setTransferTo] = useState('');
+  const [transferAmount, setTransferAmount] = useState('');
 
   useEffect(() => {
     if (!loading && (!user || role !== 'admin')) {
@@ -41,7 +51,7 @@ const Admin = () => {
     if (data) setWithdrawals(data);
   };
 
-  const updateUserStatus = async (userId: string, status: string) => {
+  const updateUserStatus = async (userId: string, status: UserStatus) => {
     const { error } = await supabase.from('profiles').update({ status }).eq('id', userId);
     if (!error) {
       toast({ title: 'Success', description: `User ${status}` });
@@ -57,6 +67,64 @@ const Admin = () => {
     }
   };
 
+  const handleTransfer = async () => {
+    if (!transferFrom || !transferTo || !transferAmount || parseFloat(transferAmount) <= 0) {
+      toast({ title: 'Error', description: 'Please fill all fields correctly', variant: 'destructive' });
+      return;
+    }
+
+    const amount = parseFloat(transferAmount);
+    const fromUser = users.find(u => u.id === transferFrom);
+    const fromBalance = parseFloat(fromUser?.wallets?.[0]?.balance || 0);
+
+    if (fromBalance < amount) {
+      toast({ title: 'Error', description: 'Insufficient balance', variant: 'destructive' });
+      return;
+    }
+
+    // Deduct from sender
+    const { error: deductError } = await supabase
+      .from('wallets')
+      .update({ balance: fromBalance - amount })
+      .eq('user_id', transferFrom)
+      .eq('currency', 'ERSX');
+
+    if (deductError) {
+      toast({ title: 'Error', description: 'Transfer failed', variant: 'destructive' });
+      return;
+    }
+
+    // Add to receiver
+    const toUser = users.find(u => u.id === transferTo);
+    const toBalance = parseFloat(toUser?.wallets?.[0]?.balance || 0);
+
+    const { error: addError } = await supabase
+      .from('wallets')
+      .update({ balance: toBalance + amount })
+      .eq('user_id', transferTo)
+      .eq('currency', 'ERSX');
+
+    if (addError) {
+      // Rollback
+      await supabase.from('wallets').update({ balance: fromBalance }).eq('user_id', transferFrom).eq('currency', 'ERSX');
+      toast({ title: 'Error', description: 'Transfer failed', variant: 'destructive' });
+      return;
+    }
+
+    // Record transactions
+    await supabase.from('transactions').insert([
+      { user_id: transferFrom, type: 'transfer', amount: -amount, description: `Transfer to ${toUser?.username}` },
+      { user_id: transferTo, type: 'transfer', amount, description: `Transfer from ${fromUser?.username}` }
+    ]);
+
+    toast({ title: 'Success', description: `Transferred ${amount} ERSX` });
+    setTransferOpen(false);
+    setTransferFrom('');
+    setTransferTo('');
+    setTransferAmount('');
+    fetchUsers();
+  };
+
   const filteredUsers = users.filter(u => u.username?.toLowerCase().includes(searchTerm.toLowerCase()) || u.email?.toLowerCase().includes(searchTerm.toLowerCase()));
 
   if (loading || role !== 'admin') return <div className="min-h-screen bg-background flex items-center justify-center"><div className="w-8 h-8 border-2 border-primary border-t-transparent rounded-full animate-spin" /></div>;
@@ -66,7 +134,48 @@ const Admin = () => {
       <Navbar />
       <main className="pt-20 pb-8 px-4">
         <div className="container mx-auto">
-          <h1 className="text-2xl font-bold mb-6 text-warning">Admin Panel</h1>
+          <div className="flex justify-between items-center mb-6">
+            <h1 className="text-2xl font-bold text-warning">Admin Panel</h1>
+            <Dialog open={transferOpen} onOpenChange={setTransferOpen}>
+              <DialogTrigger asChild>
+                <Button variant="outline"><Send className="w-4 h-4 mr-2" />Transfer Funds</Button>
+              </DialogTrigger>
+              <DialogContent>
+                <DialogHeader>
+                  <DialogTitle>Transfer Funds Between Users</DialogTitle>
+                </DialogHeader>
+                <div className="space-y-4 pt-4">
+                  <div className="space-y-2">
+                    <Label>From User</Label>
+                    <Select value={transferFrom} onValueChange={setTransferFrom}>
+                      <SelectTrigger><SelectValue placeholder="Select sender" /></SelectTrigger>
+                      <SelectContent>
+                        {users.map(u => (
+                          <SelectItem key={u.id} value={u.id}>{u.username} ({formatCurrency(parseFloat(u.wallets?.[0]?.balance || 0), 2)} ERSX)</SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </div>
+                  <div className="space-y-2">
+                    <Label>To User</Label>
+                    <Select value={transferTo} onValueChange={setTransferTo}>
+                      <SelectTrigger><SelectValue placeholder="Select receiver" /></SelectTrigger>
+                      <SelectContent>
+                        {users.filter(u => u.id !== transferFrom).map(u => (
+                          <SelectItem key={u.id} value={u.id}>{u.username} ({formatCurrency(parseFloat(u.wallets?.[0]?.balance || 0), 2)} ERSX)</SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </div>
+                  <div className="space-y-2">
+                    <Label>Amount (ERSX)</Label>
+                    <Input type="number" value={transferAmount} onChange={e => setTransferAmount(e.target.value)} placeholder="0.00" />
+                  </div>
+                  <Button onClick={handleTransfer} className="w-full">Transfer</Button>
+                </div>
+              </DialogContent>
+            </Dialog>
+          </div>
           
           <Tabs defaultValue="users">
             <TabsList className="mb-6">
